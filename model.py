@@ -1253,6 +1253,55 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+
+
+class ResidualVectorQuantizer(nn.Module):
+    """Residual quantization used by RQ-VAE style latent discretization."""
+
+    def __init__(self, dim: int, num_quantizers: int, codebook_size: int, beta: float = 0.25) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_quantizers = num_quantizers
+        self.beta = beta
+        self.codebooks = nn.Parameter(torch.randn(num_quantizers, codebook_size, dim))
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual = x
+        quantized_total = torch.zeros_like(x)
+        q_loss = x.new_tensor(0.0)
+        for i in range(self.num_quantizers):
+            cb = self.codebooks[i]
+            dists = (residual.pow(2).sum(dim=-1, keepdim=True)
+                     + cb.pow(2).sum(dim=-1).unsqueeze(0)
+                     - 2.0 * residual @ cb.t())
+            indices = torch.argmin(dists, dim=-1)
+            q = F.embedding(indices, cb)
+            quantized_total = quantized_total + q
+            residual = residual - q
+            commit_loss = F.mse_loss(x.detach(), quantized_total)
+            codebook_loss = F.mse_loss(x, quantized_total.detach())
+            q_loss = q_loss + codebook_loss + self.beta * commit_loss
+        quantized = x + (quantized_total - x).detach()
+        return quantized, q_loss
+
+
+class RQVAEAdapter(nn.Module):
+    """Small RQ-VAE adapter on top of backbone embedding."""
+
+    def __init__(self, d_model: int, latent_dim: int, num_quantizers: int, codebook_size: int, beta: float = 0.25) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, latent_dim))
+        self.rq = ResidualVectorQuantizer(latent_dim, num_quantizers, codebook_size, beta=beta)
+        self.decoder = nn.Sequential(nn.Linear(latent_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = self.encoder(x)
+        zq, q_loss = self.rq(z)
+        rec = self.decoder(zq)
+        rec_loss = F.mse_loss(rec, x)
+        return rec, rec_loss + q_loss
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1293,6 +1342,12 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # RQ-VAE adapter
+        use_rq_vae: bool = False,
+        rq_latent_dim: int = 32,
+        rq_num_quantizers: int = 2,
+        rq_codebook_size: int = 128,
+        rq_beta: float = 0.25,
     ) -> None:
         super().__init__()
 
@@ -1308,6 +1363,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_rq_vae = use_rq_vae
+        self.rq_aux_loss = None
 
         # ================== NS Tokens Construction ==================
 
@@ -1486,6 +1543,15 @@ class PCVRHyFormer(nn.Module):
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
+
+        if self.use_rq_vae:
+            self.rq_vae_adapter = RQVAEAdapter(
+                d_model=d_model,
+                latent_dim=rq_latent_dim,
+                num_quantizers=rq_num_quantizers,
+                codebook_size=rq_codebook_size,
+                beta=rq_beta,
+            )
 
         # ESMM-style multi-task heads (CTR / CVR).
         self.ctr_head = nn.Sequential(
@@ -1753,6 +1819,11 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
+
+        if self.use_rq_vae:
+            output, self.rq_aux_loss = self.rq_vae_adapter(output)
+        else:
+            self.rq_aux_loss = None
 
         # 5. ESMM coupling: pCTCVR = sigmoid(ctr) * sigmoid(cvr)
         ctr_logit = self.ctr_head(output)

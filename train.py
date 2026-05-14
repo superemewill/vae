@@ -193,6 +193,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--use_rq_vae', action='store_true', default=False,
+                        help='Enable RQ-VAE adapter on top of backbone output embedding')
+    parser.add_argument('--rq_latent_dim', type=int, default=32,
+                        help='RQ-VAE latent dimension')
+    parser.add_argument('--rq_num_quantizers', type=int, default=2,
+                        help='Number of residual quantizers')
+    parser.add_argument('--rq_codebook_size', type=int, default=128,
+                        help='Codebook size per quantizer')
+    parser.add_argument('--rq_beta', type=float, default=0.25,
+                        help='Commitment loss coefficient for RQ-VAE')
+    parser.add_argument('--rq_loss_weight', type=float, default=0.05,
+                        help='Weight of RQ-VAE auxiliary loss in total training loss')
 
     args = parser.parse_args()
 
@@ -301,6 +313,11 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "use_rq_vae": args.use_rq_vae,
+        "rq_latent_dim": args.rq_latent_dim,
+        "rq_num_quantizers": args.rq_num_quantizers,
+        "rq_codebook_size": args.rq_codebook_size,
+        "rq_beta": args.rq_beta,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -340,6 +357,7 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        rq_loss_weight=args.rq_loss_weight,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
