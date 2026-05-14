@@ -48,6 +48,7 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
+        rq_loss_weight: float = 0.05,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -100,6 +101,7 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.rq_loss_weight: float = rq_loss_weight
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -416,6 +418,8 @@ class PCVRHyFormerRankingTrainer:
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
+        if hasattr(self.model, 'rq_aux_loss') and self.model.rq_aux_loss is not None:
+            loss = loss + self.rq_loss_weight * self.model.rq_aux_loss
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
