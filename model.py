@@ -18,6 +18,8 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    intent_secondary_multi_hot: Optional[torch.Tensor] = None  # (B, K), id list with 0 as padding
+    intent_confidence: Optional[torch.Tensor] = None  # (B,) or (B, 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
