@@ -257,7 +257,8 @@ class PCVRParquetDataset(IterableDataset):
             ci = self._col_idx.get(f'item_dense_feats_{fid}')
             self._item_dense_plan.append((ci, dim, offset))
             offset += dim
-
+        self._intent_secondary_ci = self._col_idx.get('intent_secondary_multi_hot')
+        self._intent_conf_ci = self._col_idx.get('intent_confidence')
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
         self._seq_plan = {}
         for domain in self.seq_domains:
@@ -599,6 +600,20 @@ class PCVRParquetDataset(IterableDataset):
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
         }
+        if self._intent_secondary_ci is not None:
+            intent_secondary, _ = self._pad_varlen_int_column(
+                batch.column(self._intent_secondary_ci), 8, B)
+            intent_secondary[intent_secondary <= 0] = 0
+            result['intent_secondary_multi_hot'] = torch.from_numpy(intent_secondary.copy())
+        else:
+            result['intent_secondary_multi_hot'] = torch.zeros(B, 8, dtype=torch.long)
+        if self._intent_conf_ci is not None:
+            conf = batch.column(self._intent_conf_ci).fill_null(0).to_numpy(
+                zero_copy_only=False).astype(np.float32)
+            conf = np.clip(conf, 0.0, 1.0)
+            result['intent_confidence'] = torch.from_numpy(conf.copy())
+        else:
+            result['intent_confidence'] = torch.zeros(B, dtype=torch.float32)
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
