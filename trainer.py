@@ -394,6 +394,8 @@ class PCVRHyFormerRankingTrainer:
             item_int_feats=device_batch['item_int_feats'],
             user_dense_feats=device_batch['user_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
+            intent_secondary_multi_hot=device_batch.get('intent_secondary_multi_hot'),
+            intent_confidence=device_batch.get('intent_confidence'),
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
@@ -416,6 +418,10 @@ class PCVRHyFormerRankingTrainer:
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
+        gate_reg = float((self.train_config or {}).get('loss_intent_gate_reg', 0.0))
+        if gate_reg > 0 and 'intent_confidence' in device_batch:
+            conf = device_batch['intent_confidence'].float().clamp(0.0, 1.0)
+            loss = loss + gate_reg * (conf ** 2).mean()
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
@@ -442,12 +448,20 @@ class PCVRHyFormerRankingTrainer:
 
         all_logits_list = []
         all_labels_list = []
+        all_conf_list = []
+        all_cov_list = []
 
         with torch.no_grad():
             for step, batch in pbar:
                 logits, labels = self._evaluate_step(batch)
                 all_logits_list.append(logits.detach().cpu())
                 all_labels_list.append(labels.detach().cpu())
+                intent_sec = batch.get('intent_secondary_multi_hot')
+                if intent_sec is not None:
+                    all_cov_list.append((intent_sec.sum(dim=1) > 0).float().cpu())
+                conf = batch.get('intent_confidence')
+                if conf is not None:
+                    all_conf_list.append(conf.detach().float().cpu())
 
         all_logits = torch.cat(all_logits_list, dim=0)
         all_labels = torch.cat(all_labels_list, dim=0).long()
@@ -477,6 +491,18 @@ class PCVRHyFormerRankingTrainer:
             logloss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels.float()).item()
         else:
             logloss = float('inf')
+        if all_cov_list:
+            cov = torch.cat(all_cov_list).mean().item()
+            logging.info(f"[Intent] coverage={cov:.6f}")
+        if all_conf_list and len(probs) > 0 and len(np.unique(labels_np)) >= 2:
+            conf_np = torch.cat(all_conf_list).numpy()
+            bins = np.clip((conf_np * 10).astype(np.int64), 0, 9)
+            for b in range(10):
+                m = bins == b
+                if m.sum() < 10 or len(np.unique(labels_np[m])) < 2:
+                    continue
+                auc_b = float(roc_auc_score(labels_np[m], probs[m]))
+                logging.info(f"[Intent] bucket_auc conf_bin={b/10:.1f}-{(b+1)/10:.1f}: {auc_b:.6f} (n={int(m.sum())})")
 
         return auc, logloss
 
