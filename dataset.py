@@ -259,7 +259,6 @@ class PCVRParquetDataset(IterableDataset):
             offset += dim
         self._intent_secondary_ci = self._col_idx.get('intent_secondary_multi_hot')
         self._intent_conf_ci = self._col_idx.get('intent_confidence')
-
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
         self._seq_plan = {}
         for domain in self.seq_domains:
