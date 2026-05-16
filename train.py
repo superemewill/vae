@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
                         help='Learning rate for sparse parameters (Adagrad over Embeddings)')
     parser.add_argument('--sparse_weight_decay', type=float, default=0.0,
                         help='Weight decay for sparse parameters (Adagrad over Embeddings)')
-    parser.add_argument('--reinit_sparse_after_epoch', type=int, default=1,
+    parser.add_argument('--reinit_sparse_after_epoch', type=int, default=2,
                         help='Starting from the N-th epoch, at the end of every epoch '
                              're-initialize Embeddings with vocab_size > '
                              '--reinit_cardinality_threshold and rebuild the Adagrad '
@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--reinit_cardinality_threshold', type=int, default=0,
                         help='Cardinality threshold used by the re-init strategy: '
                              'Embeddings whose vocab_size exceeds this value are reset '
-                             'at each epoch end (0 = never reset any Embedding)')
+                             'at each epoch end (<=0 = disable sparse reinitialization entirely)')
 
     # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
