@@ -1619,6 +1619,38 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Loads checkpoints with backward compatibility for legacy ESMM-only weights.
+
+        Older checkpoints do not contain delay-RL/calibration parameters.
+        When missing keys are exactly from the newly added delay-aware heads,
+        downgrade to non-strict loading and keep current-module initialization.
+        """
+        missing_ok = {
+            "calibration_temperature",
+            "delay_hazard_head.0.weight",
+            "delay_hazard_head.0.bias",
+            "delay_hazard_head.2.weight",
+            "delay_hazard_head.2.bias",
+            "rl_correction_head.0.weight",
+            "rl_correction_head.0.bias",
+            "rl_correction_head.2.weight",
+            "rl_correction_head.2.bias",
+        }
+        result = super().load_state_dict(state_dict, strict=False)
+        unexpected = set(result.unexpected_keys)
+        missing = set(result.missing_keys)
+        if unexpected:
+            raise RuntimeError(
+                f"Unexpected key(s) in state_dict: {sorted(unexpected)}"
+            )
+        hard_missing = missing - missing_ok
+        if strict and hard_missing:
+            raise RuntimeError(
+                f"Missing key(s) in state_dict: {sorted(hard_missing)}"
+            )
+        return result
+
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
