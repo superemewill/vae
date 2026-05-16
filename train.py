@@ -199,6 +199,10 @@ def parse_args() -> argparse.Namespace:
                         help='Vocab size for intent_secondary_multi_hot ids.')
     parser.add_argument('--loss_intent_gate_reg', type=float, default=0.0,
                         help='Aux ablation switch: >0 adds confidence gate L2 regularization.')
+    parser.add_argument('--enable_multitask_heads', action='store_true', default=True,
+                        help='Enable CTR/CVR/VTR multi-task heads with ESMM-style CTCVR coupling.')
+    parser.add_argument('--disable_multitask_heads', dest='enable_multitask_heads', action='store_false',
+                        help='Disable multi-task heads and fallback to single-task CTR training.')
 
     args = parser.parse_args()
 
@@ -309,6 +313,7 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "enable_intent_attention": args.enable_intent_attention,
         "intent_secondary_vocab_size": args.intent_secondary_vocab_size,
+        "enable_multitask_heads": args.enable_multitask_heads,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

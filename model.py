@@ -1193,6 +1193,28 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class DynamicTaskWeighting(nn.Module):
+    """Learnable uncertainty-based task weighting.
+
+    For task losses L_i, optimized objective is:
+        sum(exp(-s_i) * L_i + s_i)
+    where s_i are learnable log-variances.
+    """
+
+    def __init__(self, task_names: List[str]) -> None:
+        super().__init__()
+        self.task_names = task_names
+        self.log_vars = nn.Parameter(torch.zeros(len(task_names)))
+
+    def forward(self, loss_dict: dict) -> torch.Tensor:
+        total = 0.0
+        for i, name in enumerate(self.task_names):
+            if name not in loss_dict:
+                continue
+            total = total + torch.exp(-self.log_vars[i]) * loss_dict[name] + self.log_vars[i]
+        return total
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1235,12 +1257,14 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         enable_intent_attention: bool = False,
         intent_secondary_vocab_size: int = 0,
+        enable_multitask_heads: bool = True,
     ) -> None:
         super().__init__()
 
         self.d_model = d_model
         self.emb_dim = emb_dim
         self.action_num = action_num
+        self.enable_multitask_heads = enable_multitask_heads
         self.num_queries = num_queries
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
@@ -1437,6 +1461,20 @@ class PCVRHyFormer(nn.Module):
 
         # Classifier
         self.clsfier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(d_model, action_num)
+        )
+        self.cvr_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(d_model, action_num)
+        )
+        self.vtr_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
             nn.SiLU(),
@@ -1700,9 +1738,19 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
-        # 5. Classifier
-        logits = self.clsfier(output)  # (B, action_num)
-        return logits
+        # 5. Task heads
+        ctr_logits = self.clsfier(output)  # (B, action_num)
+        if not self.enable_multitask_heads:
+            return ctr_logits
+
+        cvr_logits = self.cvr_head(output)
+        vtr_logits = self.vtr_head(output)
+        return {
+            'ctr_logits': ctr_logits,
+            'cvr_logits': cvr_logits,
+            'vtr_logits': vtr_logits,
+            'ctcvr_prob': torch.sigmoid(ctr_logits) * torch.sigmoid(cvr_logits),
+        }
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
