@@ -59,6 +59,10 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        delay_rl_alpha: float = 0.1,
+        delay_rl_weight: float = 0.2,
+        calibration_weight: float = 0.05,
+        advantage_clip: float = 2.0,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -109,6 +113,10 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.delay_rl_alpha: float = delay_rl_alpha
+        self.delay_rl_weight: float = delay_rl_weight
+        self.calibration_weight: float = calibration_weight
+        self.advantage_clip: float = advantage_clip
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -411,13 +419,30 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        delay_rl_out = (
+            self.model.predict_delay_rl(model_input, alpha=self.delay_rl_alpha)
+            if hasattr(self.model, "predict_delay_rl") else None
+        )
+        if delay_rl_out is not None:
+            logits = delay_rl_out["final_logit"].squeeze(-1)
+        else:
+            logits = self.model(model_input).squeeze(-1)  # (B,)
 
         if self.loss_type == 'focal':
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
+        if delay_rl_out is not None:
+            base_prob = torch.sigmoid(delay_rl_out["base_ctcvr_logit"].squeeze(-1))
+            soft_completed = delay_rl_out["soft_completed_prob"].squeeze(-1).detach()
+            advantage = (soft_completed - base_prob).clamp(
+                min=-self.advantage_clip, max=self.advantage_clip
+            ).detach()
+            pg_loss = -F.logsigmoid(logits) * advantage
+            cal_loss = F.binary_cross_entropy(
+                torch.sigmoid(logits), soft_completed
+            )
+            loss = loss + self.delay_rl_weight * pg_loss.mean() + self.calibration_weight * cal_loss
         if hasattr(self.model, 'rq_aux_loss') and self.model.rq_aux_loss is not None:
             loss = loss + self.rq_loss_weight * self.model.rq_aux_loss
         loss.backward()

@@ -1568,6 +1568,19 @@ class PCVRHyFormer(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(d_model, 1)
         )
+        # Delay-aware hazard estimation (survival-style soft completion),
+        # RL correction head, and calibration temperature.
+        self.delay_hazard_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, 1),
+        )
+        self.rl_correction_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, 1),
+        )
+        self.calibration_temperature = nn.Parameter(torch.tensor(1.0))
 
         # Initialize parameters
         self._init_params()
@@ -1848,6 +1861,33 @@ class PCVRHyFormer(nn.Module):
             'ctr_prob': ctr_prob,
             'cvr_prob': cvr_prob,
             'ctcvr_prob': ctcvr_prob,
+        }
+
+    def predict_delay_rl(self, inputs: ModelInput, alpha: float = 0.1) -> dict:
+        """Returns delay-aware ESMM scores with RL correction and calibration."""
+        ctcvr_logit, emb = self.predict(inputs)
+        ctr_logit = self.ctr_head(emb)
+        cvr_logit = self.cvr_head(emb)
+        hazard_logit = self.delay_hazard_head(emb)
+        rl_correction = self.rl_correction_head(emb)
+
+        ctr_prob = torch.sigmoid(ctr_logit)
+        cvr_prob = torch.sigmoid(cvr_logit)
+        base_ctcvr_prob = (ctr_prob * cvr_prob).clamp(min=1e-6, max=1 - 1e-6)
+        hazard_prob = torch.sigmoid(hazard_logit)
+        soft_completed_prob = (base_ctcvr_prob + (1.0 - base_ctcvr_prob) * hazard_prob).clamp(min=1e-6, max=1 - 1e-6)
+        calibrated_logit = torch.logit(soft_completed_prob) / self.calibration_temperature.clamp(min=0.05)
+        final_logit = calibrated_logit + alpha * rl_correction
+
+        return {
+            "ctr_logit": ctr_logit,
+            "cvr_logit": cvr_logit,
+            "hazard_logit": hazard_logit,
+            "rl_correction": rl_correction,
+            "base_ctcvr_logit": ctcvr_logit,
+            "final_logit": final_logit,
+            "final_prob": torch.sigmoid(final_logit),
+            "soft_completed_prob": soft_completed_prob,
         }
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
