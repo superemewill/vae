@@ -1241,6 +1241,7 @@ class PCVRHyFormer(nn.Module):
         self.num_time_buckets = num_time_buckets
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
+        self.dropout_rate = dropout_rate
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
@@ -1633,6 +1634,14 @@ class PCVRHyFormer(nn.Module):
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
+        output = self._encode_shared_repr(inputs, apply_dropout=self.training)
+
+        # 5. Classifier
+        logits = self.clsfier(output)  # (B, action_num)
+        return logits
+
+    def _encode_shared_repr(self, inputs: ModelInput, apply_dropout: bool) -> torch.Tensor:
+        """Encode input features into shared representation before task heads."""
         # 1. NS tokens: grouped projection
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
@@ -1667,48 +1676,138 @@ class PCVRHyFormer(nn.Module):
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=self.training
+            apply_dropout=apply_dropout
         )
-
-        # 5. Classifier
-        logits = self.clsfier(output)  # (B, action_num)
-        return logits
+        return output
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
-        # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)
-
-        seq_tokens_list = []
-        seq_masks_list = []
-        for domain in self.seq_domains:
-            tokens = self._embed_seq_domain(
-                inputs.seq_data[domain],
-                self._seq_embs[domain], self._seq_proj[domain],
-                self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
-            seq_tokens_list.append(tokens)
-            mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
-            seq_masks_list.append(mask)
-
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
-
-        output = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=False
-        )
-
+        output = self._encode_shared_repr(inputs, apply_dropout=False)
         logits = self.clsfier(output)
         return logits, output
+
+
+class RLCalibratedESMMHead(nn.Module):
+    """Supervisor(ESMM) + Policy(RL-calibrated) head.
+
+    This head consumes a shared backbone embedding and produces:
+      - Supervised outputs: pCTR, pCVR|click, pCTCVR, pLVTR|click, pExpWatch
+      - RL-calibrated outputs: calibrated versions of the above business scores
+      - Final ranking score from context-dependent dynamic weights
+
+    The calibration branch is intentionally lightweight and can be trained
+    while most of the backbone parameters are frozen.
+    """
+
+    def __init__(self, d_model: int, dropout_rate: float = 0.01, calib_clip: float = 0.35) -> None:
+        super().__init__()
+        self.calib_clip = calib_clip
+
+        def _tower() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model, 1),
+            )
+
+        # Supervisor towers.
+        self.ctr_tower = _tower()
+        self.cvr_click_tower = _tower()
+        self.lvtr_click_tower = _tower()
+        self.watch_time_tower = _tower()
+
+        # Policy network for RL calibration deltas.
+        self.policy_delta = nn.Sequential(
+            nn.Linear(d_model + 4, d_model),
+            nn.LayerNorm(d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, 4),
+            nn.Tanh(),
+        )
+
+        # Context-aware fusion weights over [pCTR, pCTCVR, pLVTR, pExpWatch].
+        self.policy_weight = nn.Sequential(
+            nn.Linear(d_model + 4, d_model),
+            nn.LayerNorm(d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, 4),
+        )
+
+    def forward(self, shared_repr: torch.Tensor) -> dict:
+        ctr_logit = self.ctr_tower(shared_repr)
+        cvr_click_logit = self.cvr_click_tower(shared_repr)
+        lvtr_click_logit = self.lvtr_click_tower(shared_repr)
+        watch_time_log = self.watch_time_tower(shared_repr)
+
+        p_ctr = torch.sigmoid(ctr_logit)
+        p_cvr_click = torch.sigmoid(cvr_click_logit)
+        p_ctcvr = p_ctr * p_cvr_click
+
+        p_lvtr_click = torch.sigmoid(lvtr_click_logit)
+        p_lvtr = p_ctr * p_lvtr_click
+        exp_watch_time = p_ctr * F.softplus(watch_time_log)
+
+        base_scores = torch.cat([p_ctr, p_ctcvr, p_lvtr, exp_watch_time], dim=-1)
+        policy_inp = torch.cat([shared_repr, base_scores], dim=-1)
+
+        delta = self.policy_delta(policy_inp) * self.calib_clip
+        calibrated_scores = base_scores * torch.exp(delta)
+
+        weights = torch.softmax(self.policy_weight(policy_inp), dim=-1)
+        ranking_score = torch.sum(weights * calibrated_scores, dim=-1, keepdim=True)
+
+        return {
+            'ctr_logit': ctr_logit,
+            'cvr_click_logit': cvr_click_logit,
+            'lvtr_click_logit': lvtr_click_logit,
+            'watch_time_log': watch_time_log,
+            'pCTR': p_ctr,
+            'pCVR_click': p_cvr_click,
+            'pCTCVR': p_ctcvr,
+            'pLVTR_click': p_lvtr_click,
+            'pLVTR': p_lvtr,
+            'pExpWatch': exp_watch_time,
+            'rl_delta': delta,
+            'rl_scores': calibrated_scores,
+            'rl_weights': weights,
+            'ranking_score': ranking_score,
+        }
+
+
+class SIMPLEESMMModel(PCVRHyFormer):
+    """SIM + PLE + ESMM supervisor with RL-calibrated policy layer.
+
+    The current repository backbone is PCVRHyFormer. This class reuses that
+    backbone as shared representation and replaces the single binary classifier
+    with a multi-task ESMM head + RL calibration policy.
+    """
+
+    def __init__(self, *args, calib_clip: float = 0.35, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Keep compatibility with inherited APIs while using multitask outputs.
+        self.esmm_policy_head = RLCalibratedESMMHead(
+            d_model=self.d_model,
+            dropout_rate=0.01,
+            calib_clip=calib_clip,
+        )
+
+    def forward(self, inputs: ModelInput) -> dict:
+        shared_repr = self._encode_shared_repr(inputs, apply_dropout=self.training)
+        return self.esmm_policy_head(shared_repr)
+
+    def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compatibility predict API returning CTR logit and shared representation."""
+        shared_repr = self._encode_shared_repr(inputs, apply_dropout=False)
+        out = self.esmm_policy_head(shared_repr)
+        return out['ctr_logit'], shared_repr
+
+    def freeze_backbone_for_rl_calibration(self) -> None:
+        """Freeze shared backbone and supervised towers; keep policy trainable."""
+        for p in self.parameters():
+            p.requires_grad = False
+        for p in self.esmm_policy_head.policy_delta.parameters():
+            p.requires_grad = True
+        for p in self.esmm_policy_head.policy_weight.parameters():
+            p.requires_grad = True

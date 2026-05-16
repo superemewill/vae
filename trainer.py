@@ -409,7 +409,8 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
+        model_out = self.model(model_input)
+        logits = self._extract_logits(model_out)
         logits = logits.squeeze(-1)  # (B,)
 
         if self.loss_type == 'focal':
@@ -488,7 +489,27 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+        if hasattr(self.model, 'predict'):
+            pred_out = self.model.predict(model_input)
+            if isinstance(pred_out, tuple):
+                logits = self._extract_logits(pred_out[0])
+            else:
+                logits = self._extract_logits(pred_out)
+        else:
+            logits = self._extract_logits(self.model(model_input))
         logits = logits.squeeze(-1)  # (B,)
 
         return logits, label
+
+    @staticmethod
+    def _extract_logits(model_out: Any) -> torch.Tensor:
+        """Normalize model outputs to a single logit tensor for AUC/loss."""
+        if isinstance(model_out, dict):
+            if 'ctr_logit' not in model_out:
+                raise KeyError("Dict model output must contain 'ctr_logit' for ranking trainer")
+            return model_out['ctr_logit']
+        if isinstance(model_out, tuple):
+            return model_out[0]
+        if not isinstance(model_out, torch.Tensor):
+            raise TypeError(f"Unsupported model output type: {type(model_out)}")
+        return model_out
