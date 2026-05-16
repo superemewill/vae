@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
@@ -48,6 +49,10 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
+        label_smoothing: float = 0.0,
+        logit_clip_value: float = 0.0,
+        warmup_steps: int = 2000,
+        lr_decay_type: str = 'cosine',
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -100,6 +105,10 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.label_smoothing: float = max(0.0, min(0.499999, label_smoothing))
+        self.logit_clip_value: float = max(0.0, logit_clip_value)
+        self.warmup_steps: int = max(0, int(warmup_steps))
+        self.lr_decay_type: str = lr_decay_type
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -107,9 +116,28 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.total_train_steps: int = max(1, len(self.train_loader) * self.num_epochs)
+
+        def _dense_lr_lambda(current_step: int) -> float:
+            if self.warmup_steps > 0 and current_step < self.warmup_steps:
+                return float(current_step + 1) / float(max(1, self.warmup_steps))
+            progress_denom = max(1, self.total_train_steps - self.warmup_steps)
+            progress = float(current_step - self.warmup_steps) / float(progress_denom)
+            progress = min(max(progress, 0.0), 1.0)
+            if self.lr_decay_type == 'cosine':
+                return 0.5 * (1.0 + np.cos(np.pi * progress))
+            if self.lr_decay_type == 'linear':
+                return 1.0 - progress
+            return 1.0
+
+        self.dense_scheduler = LambdaLR(self.dense_optimizer, lr_lambda=_dense_lr_lambda)
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
+                     f"label_smoothing={self.label_smoothing}, "
+                     f"logit_clip_value={self.logit_clip_value}, "
+                     f"warmup_steps={self.warmup_steps}, "
+                     f"lr_decay_type={self.lr_decay_type}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
@@ -411,6 +439,12 @@ class PCVRHyFormerRankingTrainer:
         model_input = self._make_model_input(device_batch)
         logits = self.model(model_input)  # (B, 1)
         logits = logits.squeeze(-1)  # (B,)
+        if self.logit_clip_value > 0.0:
+            logits = logits.clamp(min=-self.logit_clip_value, max=self.logit_clip_value)
+
+        if self.label_smoothing > 0.0:
+            smooth = self.label_smoothing
+            label = label * (1.0 - smooth) + (1.0 - label) * smooth
 
         if self.loss_type == 'focal':
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
@@ -422,6 +456,7 @@ class PCVRHyFormerRankingTrainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
         self.dense_optimizer.step()
+        self.dense_scheduler.step()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
 
