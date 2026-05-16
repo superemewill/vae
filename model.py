@@ -1568,6 +1568,19 @@ class PCVRHyFormer(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(d_model, 1)
         )
+        # Delay-aware hazard estimation (survival-style soft completion),
+        # RL correction head, and calibration temperature.
+        self.delay_hazard_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, 1),
+        )
+        self.rl_correction_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, 1),
+        )
+        self.calibration_temperature = nn.Parameter(torch.tensor(1.0))
 
         # Initialize parameters
         self._init_params()
@@ -1605,6 +1618,38 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Loads checkpoints with backward compatibility for legacy ESMM-only weights.
+
+        Older checkpoints do not contain delay-RL/calibration parameters.
+        When missing keys are exactly from the newly added delay-aware heads,
+        downgrade to non-strict loading and keep current-module initialization.
+        """
+        missing_ok = {
+            "calibration_temperature",
+            "delay_hazard_head.0.weight",
+            "delay_hazard_head.0.bias",
+            "delay_hazard_head.2.weight",
+            "delay_hazard_head.2.bias",
+            "rl_correction_head.0.weight",
+            "rl_correction_head.0.bias",
+            "rl_correction_head.2.weight",
+            "rl_correction_head.2.bias",
+        }
+        result = super().load_state_dict(state_dict, strict=False)
+        unexpected = set(result.unexpected_keys)
+        missing = set(result.missing_keys)
+        if unexpected:
+            raise RuntimeError(
+                f"Unexpected key(s) in state_dict: {sorted(unexpected)}"
+            )
+        hard_missing = missing - missing_ok
+        if strict and hard_missing:
+            raise RuntimeError(
+                f"Missing key(s) in state_dict: {sorted(hard_missing)}"
+            )
+        return result
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1848,6 +1893,33 @@ class PCVRHyFormer(nn.Module):
             'ctr_prob': ctr_prob,
             'cvr_prob': cvr_prob,
             'ctcvr_prob': ctcvr_prob,
+        }
+
+    def predict_delay_rl(self, inputs: ModelInput, alpha: float = 0.1) -> dict:
+        """Returns delay-aware ESMM scores with RL correction and calibration."""
+        ctcvr_logit, emb = self.predict(inputs)
+        ctr_logit = self.ctr_head(emb)
+        cvr_logit = self.cvr_head(emb)
+        hazard_logit = self.delay_hazard_head(emb)
+        rl_correction = self.rl_correction_head(emb)
+
+        ctr_prob = torch.sigmoid(ctr_logit)
+        cvr_prob = torch.sigmoid(cvr_logit)
+        base_ctcvr_prob = (ctr_prob * cvr_prob).clamp(min=1e-6, max=1 - 1e-6)
+        hazard_prob = torch.sigmoid(hazard_logit)
+        soft_completed_prob = (base_ctcvr_prob + (1.0 - base_ctcvr_prob) * hazard_prob).clamp(min=1e-6, max=1 - 1e-6)
+        calibrated_logit = torch.logit(soft_completed_prob) / self.calibration_temperature.clamp(min=0.05)
+        final_logit = calibrated_logit + alpha * rl_correction
+
+        return {
+            "ctr_logit": ctr_logit,
+            "cvr_logit": cvr_logit,
+            "hazard_logit": hazard_logit,
+            "rl_correction": rl_correction,
+            "base_ctcvr_logit": ctcvr_logit,
+            "final_logit": final_logit,
+            "final_prob": torch.sigmoid(final_logit),
+            "soft_completed_prob": soft_completed_prob,
         }
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
