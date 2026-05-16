@@ -352,7 +352,11 @@ class PCVRHyFormerRankingTrainer:
             # Reference: KuaiShou Tech., "MultiEpoch: Reusing Training Data
             # for Click-Through Rate Prediction",
             # https://arxiv.org/pdf/2305.19531
-            if epoch >= self.reinit_sparse_after_epoch and self.sparse_optimizer is not None:
+            if (
+                epoch >= self.reinit_sparse_after_epoch
+                and self.sparse_optimizer is not None
+                and self.reinit_cardinality_threshold > 0
+            ):
                 # Snapshot Adagrad state per parameter via data_ptr, so state
                 # of low-cardinality embeddings can be preserved across rebuild.
                 old_state: Dict[int, Any] = {}
@@ -374,6 +378,10 @@ class PCVRHyFormerRankingTrainer:
                         restored += 1
                 logging.info(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
                              f"restored optimizer state for {restored} low-cardinality params")
+            elif epoch >= self.reinit_sparse_after_epoch and self.sparse_optimizer is not None:
+                logging.info(
+                    "Skip sparse reinit: reinit_cardinality_threshold<=0 (disabled)"
+                )
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
         """Construct a ``ModelInput`` NamedTuple from a device_batch dict."""
