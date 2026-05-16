@@ -20,7 +20,7 @@ import torch
 
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
-from model import PCVRHyFormer
+from model import PCVRHyFormer, SIMPLEESMMModel
 from trainer import PCVRHyFormerRankingTrainer
 
 
@@ -117,6 +117,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--action_num', type=int, default=1,
                         help='Classifier output dimension '
                              '(1 = single binary-classification logit; >1 = multi-label)')
+    parser.add_argument('--model_type', type=str, default='pcvr_hyformer',
+                        choices=['pcvr_hyformer', 'simple_esmm'],
+                        help='Model variant: baseline PCVRHyFormer or SIMPLEESMMModel')
     parser.add_argument('--use_time_buckets', action='store_true', default=True,
                         help='Enable the time-bucket embedding (default on). '
                              'The actual bucket count is uniquely determined by '
@@ -201,12 +204,18 @@ def parse_args() -> argparse.Namespace:
     args.ckpt_dir = os.environ.get('TRAIN_CKPT_PATH', args.ckpt_dir)
     args.log_dir = os.environ.get('TRAIN_LOG_PATH', args.log_dir)
     args.tf_events_dir = os.environ.get('TRAIN_TF_EVENTS_PATH')
+    if not args.tf_events_dir:
+        # Keep training runnable even when TRAIN_TF_EVENTS_PATH is not set.
+        args.tf_events_dir = os.path.join(args.log_dir or './logs', 'tf_events')
 
     return args
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.model_type == 'simple_esmm' and args.action_num != 1:
+        raise ValueError("SIMPLEESMMModel currently supports action_num=1 only")
 
     # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -303,13 +312,17 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
     }
 
-    model = PCVRHyFormer(**model_args).to(args.device)
+    model_cls = PCVRHyFormer if args.model_type == 'pcvr_hyformer' else SIMPLEESMMModel
+    model = model_cls(**model_args).to(args.device)
 
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(
+        f"{model_cls.__name__} model created: num_ns={num_ns}, T={T}, "
+        f"d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}"
+    )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
