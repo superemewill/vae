@@ -108,6 +108,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--dropout_rate', type=float, default=0.01,
                         help='Dropout rate for the backbone '
                              '(seq id-embedding dropout is twice this value)')
+    parser.add_argument('--high_card_emb_dropout', type=float, default=0.2,
+                        help='Dropout rate applied to high-cardinality sequence '
+                             'ID embeddings (recommended 0.2~0.3).')
     parser.add_argument('--seq_top_k', type=int, default=50,
                         help='Number of most-recent tokens kept by LongerEncoder '
                              '(only effective when --seq_encoder_type=longer)')
@@ -143,6 +146,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='Binary label smoothing factor in [0, 0.5). '
+                             'Use small values (e.g. 0.01~0.05) to reduce '
+                             'spiky updates from noisy hard labels.')
+    parser.add_argument('--logit_clip_value', type=float, default=0.0,
+                        help='If > 0, clip logits into '
+                             '[-logit_clip_value, +logit_clip_value] '
+                             'before loss computation to suppress extreme '
+                             'samples that cause loss spikes.')
+    parser.add_argument('--warmup_steps', type=int, default=2000,
+                        help='Linear warmup steps for dense optimizer learning rate.')
+    parser.add_argument('--lr_decay_type', type=str, default='cosine',
+                        choices=['cosine', 'linear', 'none'],
+                        help='LR decay after warmup for dense optimizer.')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -289,6 +306,7 @@ def main() -> None:
         "seq_encoder_type": args.seq_encoder_type,
         "hidden_mult": args.hidden_mult,
         "dropout_rate": args.dropout_rate,
+        "high_card_emb_dropout": args.high_card_emb_dropout,
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
@@ -340,6 +358,10 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        label_smoothing=args.label_smoothing,
+        logit_clip_value=args.logit_clip_value,
+        warmup_steps=args.warmup_steps,
+        lr_decay_type=args.lr_decay_type,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,

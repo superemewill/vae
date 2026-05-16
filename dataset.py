@@ -106,19 +106,14 @@ class FeatureSchema:
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-# Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
-BUCKET_BOUNDARIES = np.array([
-    5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
-    120, 180, 240, 300, 360, 420, 480, 540, 600,
-    900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600,
-    5400, 7200, 9000, 10800, 12600, 14400, 16200, 18000, 19800, 21600,
-    32400, 43200, 54000, 64800, 75600, 86400,
-    172800, 259200, 345600, 432000, 518400, 604800,
-    1123200, 1641600, 2160000, 2592000,
-    4320000, 6048000, 7776000,
-    11664000, 15552000,
-    31536000,
-], dtype=np.int64)
+# Time-delta bucket boundaries (256 edges -> 257 buckets: 0=padding, 1..256).
+# Uses log-spaced edges in [5 sec, 365 days] for finer granularity across
+# both short and long behaviors, reducing distribution shift from mixed lengths.
+_BUCKET_EDGES = np.geomspace(5, 31536000, num=256)
+BUCKET_BOUNDARIES = np.rint(_BUCKET_EDGES).astype(np.int64)
+for i in range(1, BUCKET_BOUNDARIES.shape[0]):
+    if BUCKET_BOUNDARIES[i] <= BUCKET_BOUNDARIES[i - 1]:
+        BUCKET_BOUNDARIES[i] = BUCKET_BOUNDARIES[i - 1] + 1
 
 # Total number of time-bucket embedding slots (= number of boundaries + 1, with
 # padding=0 included).

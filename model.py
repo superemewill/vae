@@ -1280,6 +1280,7 @@ class PCVRHyFormer(nn.Module):
         seq_encoder_type: str = 'transformer',
         hidden_mult: int = 4,
         dropout_rate: float = 0.01,
+        high_card_emb_dropout: float = 0.2,
         seq_top_k: int = 50,
         seq_causal: bool = False,
         action_num: int = 1,
@@ -1395,7 +1396,7 @@ class PCVRHyFormer(nn.Module):
         # seq_id_threshold decides which features inside the seq tokenizer are
         # treated as id features (they receive extra dropout). It is fully
         # independent of emb_skip_threshold (which skips Embedding creation).
-        self.seq_id_emb_dropout = nn.Dropout(dropout_rate * 2)
+        self.seq_id_emb_dropout = nn.Dropout(high_card_emb_dropout)
 
         def _make_seq_embs(vocab_sizes):
             """Create embedding list, returning None for features skipped via
