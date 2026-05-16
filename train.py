@@ -14,18 +14,21 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import get_pcvr_data, NUM_TIME_BUCKETS
+
+if TYPE_CHECKING:
+    from dataset import FeatureSchema
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
 
 def build_feature_specs(
-    schema: FeatureSchema,
+    schema: "FeatureSchema",
     per_position_vocab_sizes: List[int],
 ) -> List[Tuple[int, int, int]]:
     """Build feature_specs of the form ``[(vocab_size, offset, length), ...]``
