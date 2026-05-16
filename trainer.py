@@ -411,13 +411,30 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
-
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        out = self.model(model_input)
+        if isinstance(out, dict):
+            ctr_logits = out['ctr_logits'].squeeze(-1)
+            cvr_logits = out['cvr_logits'].squeeze(-1)
+            vtr_logits = out['vtr_logits'].squeeze(-1)
+            # Backward-compatible labels: when no explicit labels exist in batch, reuse click label.
+            ctr_label = label
+            ctcvr_label = device_batch.get('label_ctcvr', label).float()
+            vtr_label = device_batch.get('label_vtr', label).float()
+            if self.loss_type == 'focal':
+                ctr_loss = sigmoid_focal_loss(ctr_logits, ctr_label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                ctr_loss = F.binary_cross_entropy_with_logits(ctr_logits, ctr_label)
+            ctcvr_prob = torch.sigmoid(ctr_logits) * torch.sigmoid(cvr_logits)
+            ctcvr_loss = F.binary_cross_entropy(
+                ctcvr_prob.clamp(min=1e-6, max=1 - 1e-6), ctcvr_label)
+            vtr_loss = F.binary_cross_entropy_with_logits(vtr_logits, vtr_label)
+            loss = ctr_loss + ctcvr_loss + vtr_loss
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
+            logits = out.squeeze(-1)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
         gate_reg = float((self.train_config or {}).get('loss_intent_gate_reg', 0.0))
         if gate_reg > 0 and 'intent_confidence' in device_batch:
             conf = device_batch['intent_confidence'].float().clamp(0.0, 1.0)
