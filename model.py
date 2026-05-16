@@ -16,8 +16,6 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
-    intent_secondary_multi_hot: Optional[torch.Tensor] = None  # (B, K), id list with 0 as padding
-    intent_confidence: Optional[torch.Tensor] = None  # (B,) or (B, 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1191,28 +1189,6 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
-class DynamicTaskWeighting(nn.Module):
-    """Learnable uncertainty-based task weighting.
-
-    For task losses L_i, optimized objective is:
-        sum(exp(-s_i) * L_i + s_i)
-    where s_i are learnable log-variances.
-    """
-
-    def __init__(self, task_names: List[str]) -> None:
-        super().__init__()
-        self.task_names = task_names
-        self.log_vars = nn.Parameter(torch.zeros(len(task_names)))
-
-    def forward(self, loss_dict: dict) -> torch.Tensor:
-        total = 0.0
-        for i, name in enumerate(self.task_names):
-            if name not in loss_dict:
-                continue
-            total = total + torch.exp(-self.log_vars[i]) * loss_dict[name] + self.log_vars[i]
-        return total
-
-
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1253,16 +1229,12 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
-        enable_intent_attention: bool = False,
-        intent_secondary_vocab_size: int = 0,
-        enable_multitask_heads: bool = True,
     ) -> None:
         super().__init__()
 
         self.d_model = d_model
         self.emb_dim = emb_dim
         self.action_num = action_num
-        self.enable_multitask_heads = enable_multitask_heads
         self.num_queries = num_queries
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
@@ -1272,7 +1244,6 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
-        self.enable_intent_attention = enable_intent_attention
 
         # ================== NS Tokens Construction ==================
 
@@ -1339,17 +1310,10 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(item_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
-        if self.enable_intent_attention:
-            if intent_secondary_vocab_size <= 0:
-                raise ValueError("intent_secondary_vocab_size must be > 0 when enable_intent_attention=True")
-            self.intent_secondary_emb = nn.Embedding(intent_secondary_vocab_size + 1, d_model, padding_idx=0)
-            self.intent_attn_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-            self.intent_gate_mlp = nn.Sequential(nn.Linear(1, d_model), nn.Sigmoid())
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0)
-                       + (1 if self.enable_intent_attention else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1459,20 +1423,6 @@ class PCVRHyFormer(nn.Module):
 
         # Classifier
         self.clsfier = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-            nn.SiLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(d_model, action_num)
-        )
-        self.cvr_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-            nn.SiLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(d_model, action_num)
-        )
-        self.vtr_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
             nn.SiLU(),
@@ -1695,22 +1645,6 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
-        if self.enable_intent_attention:
-            if inputs.intent_secondary_multi_hot is None or inputs.intent_confidence is None:
-                raise ValueError("intent inputs must be provided when enable_intent_attention=True")
-            intent_ids = inputs.intent_secondary_multi_hot.long()  # (B, K)
-            intent_kv = self.intent_secondary_emb(intent_ids)  # (B, K, D)
-            kpm = (intent_ids == 0)
-            q = self.intent_attn_query.expand(intent_kv.shape[0], -1, -1)  # (B,1,D)
-            scores = torch.matmul(q, intent_kv.transpose(1, 2)) / math.sqrt(self.d_model)  # (B,1,K)
-            scores = scores.masked_fill(kpm.unsqueeze(1), float('-inf'))
-            all_pad = kpm.all(dim=1, keepdim=True).unsqueeze(-1)
-            scores = torch.where(all_pad, torch.zeros_like(scores), scores)
-            attn = torch.softmax(scores, dim=-1)
-            intent_tok = torch.matmul(attn, intent_kv)  # (B,1,D)
-            conf = inputs.intent_confidence.float().view(-1, 1).clamp_(0.0, 1.0)
-            gate = self.intent_gate_mlp(conf).unsqueeze(1)  # (B,1,D)
-            ns_parts.append(intent_tok * gate)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1736,19 +1670,9 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
-        # 5. Task heads
-        ctr_logits = self.clsfier(output)  # (B, action_num)
-        if not self.enable_multitask_heads:
-            return ctr_logits
-
-        cvr_logits = self.cvr_head(output)
-        vtr_logits = self.vtr_head(output)
-        return {
-            'ctr_logits': ctr_logits,
-            'cvr_logits': cvr_logits,
-            'vtr_logits': vtr_logits,
-            'ctcvr_prob': torch.sigmoid(ctr_logits) * torch.sigmoid(cvr_logits),
-        }
+        # 5. Classifier
+        logits = self.clsfier(output)  # (B, action_num)
+        return logits
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
@@ -1764,20 +1688,6 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
-        if self.enable_intent_attention:
-            intent_ids = inputs.intent_secondary_multi_hot.long()
-            intent_kv = self.intent_secondary_emb(intent_ids)
-            kpm = (intent_ids == 0)
-            q = self.intent_attn_query.expand(intent_kv.shape[0], -1, -1)
-            scores = torch.matmul(q, intent_kv.transpose(1, 2)) / math.sqrt(self.d_model)
-            scores = scores.masked_fill(kpm.unsqueeze(1), float('-inf'))
-            all_pad = kpm.all(dim=1, keepdim=True).unsqueeze(-1)
-            scores = torch.where(all_pad, torch.zeros_like(scores), scores)
-            attn = torch.softmax(scores, dim=-1)
-            intent_tok = torch.matmul(attn, intent_kv)
-            conf = inputs.intent_confidence.float().view(-1, 1).clamp_(0.0, 1.0)
-            gate = self.intent_gate_mlp(conf).unsqueeze(1)
-            ns_parts.append(intent_tok * gate)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
